@@ -8,6 +8,8 @@
 This is a wrapper/port of the Android ARM64 version of Jetpack Joyride (`1.104.1`). <br/>
 It loads the original game's ARM64 library and runs it as-is inside a minimal Android compatibility environment.
 
+Current port version: **1.0.1**.
+
 ### How to install
 
 You will need a legally obtained copy of Jetpack Joyride `1.104.1`.
@@ -30,6 +32,14 @@ On first boot, the port validates the game data, locates the required library an
 
 This will not work in applet/album mode. Use a game override (hold R while launching a title) or a forwarder so the game receives the full application memory pool and the required code-memory permissions.
 
+### Controls
+
+Controller mode is enabled by default, with the cursor hidden. Use the D-pad or left stick to navigate menus and the game's normal controller buttons to play. Press **Minus (-)** to touch the bottom-center of the screen and start a run from the title screen.
+
+Press **ZL** to toggle mouse mode. In mouse mode, move the cursor with the left stick and click/hold with **A** or **ZR**. The physical touchscreen works in both modes and at every supported rendering resolution. When touch sources overlap, the physical touchscreen takes priority over Minus, followed by the cursor click.
+
+SAM daily resets and other time-gated features use the console's system clock while offline. Keep the console date and time accurate. Online services remain unavailable.
+
 ### How to build
 
 You need devkitA64 plus the following devkitPro packages:
@@ -39,6 +49,8 @@ You need devkitA64 plus the following devkitPro packages:
 * `switch-sdl2`
 * `switch-zlib`
 
+The build also uses `pkg-config` and the static dependencies supplied by the installed SDL/Mesa packages (including Vulkan, zstd and Expat with recent Mesa versions).
+
 From an MSYS2 environment with devkitPro mounted at `/opt/devkitpro`:
 
 ```bash
@@ -46,6 +58,12 @@ From an MSYS2 environment with devkitPro mounted at `/opt/devkitpro`:
 ```
 
 The resulting release build is `jetpackjoyride_nx.nro`.
+
+Input and offline time-sync regression checks can be run on a desktop with Python 3 and a native C compiler:
+
+```bash
+python tests/run_regressions.py --cc clang
+```
 
 ### Credits
 

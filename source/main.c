@@ -7,6 +7,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -420,6 +421,57 @@ static bool offline_notification_permission(void) {
   return true;
 }
 
+/* Jetpack::TimeService normally confirms the device clock by POSTing to a
+ * Halfbrick endpoint and reading the UTC seconds it echoes back. Nothing
+ * else here calls out to the internet, so that round trip always times
+ * out, timeJJ::IsServerTimeReliable() stays false, and every feature that
+ * gates on it refuses to run: SAMRewardSystem's daily reset (Strong Arm
+ * Machine), DailyMissions::Sync, Game::UpdateDiscountedItems,
+ * Level::SetupNextBarryBotToken, TitleMenu::Update, notice-board/ad-
+ * mediation date checks, and more.
+ *
+ * Queue a synthetic response to RequestTimeUpdate(), also reached through
+ * ForceUpdate(). The UI sets its pending flag AFTER ForceUpdate() returns,
+ * so listener callbacks must run later, outside the game's update stack.
+ * Use the game's own weak_ptr-aware dispatcher to retain listener lifetime
+ * management and the normal success triggers. All offsets below are for
+ * the signature-checked 1.104.1 ARM64 build. */
+typedef void (*time_service_notify_fn)(void *service, void *listeners,
+                                       uintptr_t method, ptrdiff_t adjustment);
+static time_service_notify_fn time_service_notify;
+static void *pending_time_service;
+
+static bool spoof_time_service_request_update(void *time_service) {
+  uint8_t *ts = (uint8_t *)time_service;
+  if (pending_time_service || *(uint8_t *)(ts + 0xe8) ||
+      *(int32_t *)(ts + 0x104) > 0)
+    return false;
+
+  *(uint8_t *)(ts + 0xe8) = 1; /* request in flight */
+  *(int32_t *)(ts + 0x104) = *(int32_t *)(ts + 0xd0);
+  pending_time_service = time_service;
+  return true;
+}
+
+static void process_offline_time_sync(void) {
+  uint8_t *ts = (uint8_t *)pending_time_service;
+  if (!ts) return;
+  /* A listener may request another update; leave that for the next frame. */
+  pending_time_service = NULL;
+  const int64_t now = (int64_t)time(NULL);
+
+  *(uint8_t *)(ts + 0xe8) = 0;    /* no request in flight */
+  *(uint8_t *)(ts + 0xd4) = 1;    /* reliable */
+  *(int64_t *)(ts + 0xd8) = 0;    /* accumulated drift */
+  *(int64_t *)(ts + 0xe0) = now;  /* local clock at "receipt" */
+  *(int64_t *)(ts + 0xf0) = now;  /* local clock at "request" */
+  *(int64_t *)(ts + 0xf8) = now;  /* corrected server epoch */
+  *(int32_t *)(ts + 0x100) = 0;   /* baseline offset (perfect sync) */
+  /* ARM64 libc++ member pointer: virtual slot 0x10, adjustment 0 + virtual
+   * bit 1. This is the exact success dispatch used by OnDownloadResponse(). */
+  time_service_notify(ts, ts + 0x108, 0x10, 1);
+}
+
 typedef void *(*splash_game_get_fn)(void);
 typedef bool (*splash_load_content_fn)(void *game, int *state);
 typedef void (*splash_setup_text_fn)(void *splash);
@@ -585,6 +637,46 @@ static void install_offline_service_patches(void) {
     fatal_error("Unsupported SplashScreens update code in libmortargame.so.");
   hook_arm64((uintptr_t)code, (uintptr_t)splash_update_with_cpu_boost);
   armDCacheFlush(code, 4 * sizeof(*code));
+
+  /* Trust the console's own clock instead of failing the server-time sync;
+   * see spoof_time_service_request_update() for why. */
+  static const char time_service_request_update[] =
+      "_ZN7Jetpack11TimeService17RequestTimeUpdateEv";
+  static const uint32_t expected_time_service_request_update[] = {
+    UINT32_C(0xd10443ff), /* sub sp, sp, #0x110 */
+    UINT32_C(0xa90e7bfd), /* stp x29, x30, [sp, #0xe0] */
+    UINT32_C(0xa90f57fc), /* stp x28, x21, [sp, #0xf0] */
+    UINT32_C(0xa9104ff4), /* stp x20, x19, [sp, #0x100] */
+  };
+
+  code = (uint32_t *)so_find_addr(&mortar_mod, time_service_request_update);
+  if (!code || memcmp(code, expected_time_service_request_update,
+                      sizeof expected_time_service_request_update) != 0)
+    fatal_error("Unsupported TimeService code in libmortargame.so.");
+
+  static const char time_service_response[] =
+      "_ZN7Jetpack11TimeService18OnDownloadResponseEPN6Mortar11HttpRequestEPNS1_12HttpResponseE";
+  static const uint32_t expected_time_service_dispatch[] = {
+    UINT32_C(0xd10203ff), /* sub sp, sp, #0x80 */
+    UINT32_C(0xa9027bfd), /* stp x29, x30, [sp, #0x20] */
+    UINT32_C(0xf9001bfb), /* str x27, [sp, #0x30] */
+    UINT32_C(0xa90467fa), /* stp x26, x25, [sp, #0x40] */
+  };
+  const uint32_t *response = (const uint32_t *)so_find_addr(
+      &mortar_mod, time_service_response);
+  /* Verify both the success member pointer and its call to the internal
+   * dispatcher before reusing that helper at OnDownloadResponse + 0x290. */
+  if (!response || response[0xa8 / 4] != UINT32_C(0x52800023) ||
+      response[0xac / 4] != UINT32_C(0x52800202) ||
+      response[0x15c / 4] != UINT32_C(0x9400004d) ||
+      memcmp(response + 0x290 / 4, expected_time_service_dispatch,
+             sizeof expected_time_service_dispatch) != 0)
+    fatal_error("Unsupported TimeService listener code in libmortargame.so.");
+  time_service_notify = (time_service_notify_fn)(
+      so_find_addr_rx(&mortar_mod, time_service_response) + 0x290);
+
+  hook_arm64((uintptr_t)code, (uintptr_t)spoof_time_service_request_update);
+  armDCacheFlush(code, 4 * sizeof(*code));
 }
 
 typedef struct {
@@ -741,6 +833,10 @@ static int64_t event_time_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+typedef enum {
+  TOUCH_NONE, TOUCH_PHYSICAL, TOUCH_MINUS, TOUCH_CURSOR
+} TouchSource;
+
 typedef struct {
   PadState pad;
   HidTouchScreenState touch_state;
@@ -749,6 +845,9 @@ typedef struct {
   float cursor_x, cursor_y;
   uint64_t previous_ns;
   int cursor_visible;
+  int mouse_mode; /* 1 = on-screen cursor active, 0 = full controller passthrough */
+  int prev_hat; /* combined physical/stick D-pad: up, down, left, right */
+  TouchSource touch_source;
 } InputState;
 
 typedef struct { uint64_t button; int android_key; } KeyBinding;
@@ -756,11 +855,9 @@ static const KeyBinding key_bindings[] = {
   { HidNpadButton_A,      96 }, { HidNpadButton_B,      97 },
   { HidNpadButton_X,      99 }, { HidNpadButton_Y,     100 },
   { HidNpadButton_L,     102 }, { HidNpadButton_R,     103 },
-  { HidNpadButton_ZL,    104 }, { HidNpadButton_ZR,    105 },
+  { HidNpadButton_ZR,    105 },
   { HidNpadButton_StickL,106 }, { HidNpadButton_StickR,107 },
-  { HidNpadButton_Plus,  108 }, { HidNpadButton_Minus, 109 },
-  { HidNpadButton_Up,     19 }, { HidNpadButton_Down,   20 },
-  { HidNpadButton_Left,   21 }, { HidNpadButton_Right,  22 },
+  { HidNpadButton_Plus,  108 },
 };
 
 static uint64_t monotonic_ns(void) {
@@ -777,8 +874,7 @@ static void input_init(InputState *input) {
   input->cursor_x = input->last_x = 0.5f;
   input->cursor_y = input->last_y = 0.5f;
   input->previous_ns = monotonic_ns();
-  input->cursor_visible =
-      appletGetOperationMode() == AppletOperationMode_Console;
+  /* Controller mode starts with the cursor hidden in handheld and docked. */
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
@@ -795,6 +891,14 @@ static void input_update(InputState *input, const MortarApi *api,
   const uint64_t down = padGetButtonsDown(&input->pad);
   const uint64_t up = padGetButtonsUp(&input->pad);
   const uint64_t held = padGetButtons(&input->pad);
+
+  /* The common D-pad/touch paths below release state from the old mode. */
+  if (down & HidNpadButton_ZL) {
+    input->mouse_mode = !input->mouse_mode;
+    if (!input->mouse_mode)
+      api->motion(env, thiz, 0, 0, 0.0f, 0.0f);
+  }
+
   for (size_t i = 0; i < sizeof key_bindings / sizeof key_bindings[0]; ++i) {
     if (down & key_bindings[i].button)
       api->key(env, thiz, key_bindings[i].android_key, 1, 0, 0);
@@ -811,38 +915,62 @@ static void input_update(InputState *input, const MortarApi *api,
   float sy = (float)stick.y / 32768.0f;
   if (sx > -0.14f && sx < 0.14f) sx = 0.0f;
   if (sy > -0.14f && sy < 0.14f) sy = 0.0f;
-  if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
-  input->cursor_x += sx * dt * 0.75f;
-  input->cursor_y -= sy * dt * 0.75f;
-  if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
-  if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
-  if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
-  if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
-  api->motion(env, thiz, 0, 0, sx, -sy);
 
-  int physical = 0;
+  /* Emit transitions for the combined state, including in mouse mode, so
+   * leaving stick navigation releases it without cancelling a held D-pad. */
+  const int mask =
+      ((held & HidNpadButton_Up) || (!input->mouse_mode && sy > 0.5f) ? 1 : 0) |
+      ((held & HidNpadButton_Down) || (!input->mouse_mode && sy < -0.5f) ? 2 : 0) |
+      ((held & HidNpadButton_Left) || (!input->mouse_mode && sx < -0.5f) ? 4 : 0) |
+      ((held & HidNpadButton_Right) || (!input->mouse_mode && sx > 0.5f) ? 8 : 0);
+  const int changed = mask ^ input->prev_hat;
+  for (int i = 0; i < 4; ++i) {
+    if (changed & (1 << i))
+      api->key(env, thiz, 19 + i, (mask & (1 << i)) != 0, 0, 0);
+  }
+  input->prev_hat = mask;
+
+  if (input->mouse_mode) {
+    input->cursor_x += sx * dt * 0.75f;
+    input->cursor_y -= sy * dt * 0.75f;
+    if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
+    if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
+    if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
+    if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
+    api->motion(env, thiz, 0, 0, sx, -sy);
+  }
+
+  const int physical = hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
+                       input->touch_state.count > 0;
+  input->cursor_visible = input->mouse_mode && !physical;
+
+  /* One pointer, with explicit priority: real finger, Minus, cursor click.
+   * Releasing a lower-priority source must not release the current owner. */
+  TouchSource source = TOUCH_NONE;
   float x = input->cursor_x, y = input->cursor_y;
-  if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
-      input->touch_state.count > 0) {
-    physical = 1;
-    input->cursor_visible = 0;
+  if (physical) {
+    source = TOUCH_PHYSICAL;
+    /* HID coordinates describe the 1280x720 touch surface, not the render target. */
     x = (float)input->touch_state.touches[0].x / 1280.0f;
     y = (float)input->touch_state.touches[0].y / 720.0f;
+  } else if (held & HidNpadButton_Minus) {
+    source = TOUCH_MINUS;
+    x = 0.5f;
+    y = (float)(screen_height - 1) / (float)screen_height;
+  } else if (input->mouse_mode &&
+             (held & (HidNpadButton_A | HidNpadButton_ZR))) {
+    source = TOUCH_CURSOR;
   }
-  const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
-  if (button_touch && !physical) input->cursor_visible = 1;
-  const int wanted = physical || button_touch;
-  if (wanted && !input->active_touch)
-    send_touch(api, env, thiz, 0, x, y);
-  else if (wanted)
-    send_touch(api, env, thiz, 2, x, y);
-  else if (input->active_touch)
+
+  if (input->active_touch && source != input->touch_source)
     send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-  input->active_touch = wanted;
-  if (wanted) {
+  if (source) {
+    send_touch(api, env, thiz, source == input->touch_source ? 2 : 0, x, y);
     input->last_x = x;
     input->last_y = y;
   }
+  input->active_touch = source != TOUCH_NONE;
+  input->touch_source = source;
 }
 
 typedef struct {
@@ -894,7 +1022,7 @@ static void cursor_renderer_init(CursorRenderer *cursor) {
 
 static void cursor_renderer_draw(const CursorRenderer *cursor,
                                  const InputState *input) {
-  if (!cursor->ready || !input->cursor_visible) return;
+  if (!cursor->ready || !input->mouse_mode || !input->cursor_visible) return;
   GLint old_program = 0, old_buffer = 0, old_framebuffer = 0;
   GLint old_viewport[4] = {0};
   GLint attribute_enabled = 0;
@@ -1101,6 +1229,7 @@ int main(int argc, char **argv) {
     input_update(&input, &api, env, thiz);
     jni_process_soft_keyboard();
     jni_process_deferred_callbacks();
+    process_offline_time_sync();
     const jboolean keep_running = api.step(env, thiz);
     if (resuming) resuming = api.resume_step(env, thiz) != 0;
     cursor_renderer_draw(&cursor, &input);

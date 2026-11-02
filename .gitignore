@@ -11,3 +11,12 @@ assets.nxpack.tmp
 assets.nxidx
 assets.nxidx.tmp
 /.synth*
+
+# Local SD card copy (proprietary game assets/binaries) and build outputs
+# anywhere in the tree, not just at the repo root.
+/sdmc/
+*.elf
+*.nacp
+*.nro
+/dist/
+/.build-release.log

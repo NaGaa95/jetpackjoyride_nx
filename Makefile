@@ -9,7 +9,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET    := jetpackjoyride_nx
 APP_TITLE := Jetpack Joyride
 APP_AUTHOR := naga
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 APP_ICON  := $(TOPDIR)/icon.jpg
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 BUILD     := build
@@ -25,7 +25,12 @@ CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS := $(ARCH)
 LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,--gc-sections
 
-LIBS := -lSDL2 -lGLESv2 -lEGL -lglapi -ldrm_nouveau -lz -lnx -lm
+# Let the installed Mesa/SDL packages supply their static dependencies.
+# Recent Mesa builds also require Vulkan, zstd and Expat; keep archive
+# dependencies in a group so their cross-references resolve correctly.
+PKG_CONFIG := aarch64-none-elf-pkg-config
+LIBS := -Wl,--start-group $(shell $(PKG_CONFIG) --libs sdl2 glesv2 egl) \
+        -ldrm_nouveau -lz -lnx -lm -Wl,--end-group
 
 LIBDIRS := $(PORTLIBS) $(LIBNX)
 
