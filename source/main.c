@@ -7,6 +7,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -429,15 +430,34 @@ static bool offline_notification_permission(void) {
  * Level::SetupNextBarryBotToken, TitleMenu::Update, notice-board/ad-
  * mediation date checks, and more.
  *
- * This replaces TimeService::RequestTimeUpdate() (also reached through
- * ForceUpdate()) with a synthetic reply: it fills in exactly the fields
- * TimeService::OnDownloadResponse() would after a perfect, zero-latency
- * HTTP 200 whose body is the current time -- using the console's own
- * clock as the "server" answer instead of opening a socket. Everything
- * downstream (IsReliable(), GetTime(), the periodic re-sync in Update())
- * is untouched and keeps working exactly as designed. */
+ * Queue a synthetic response to RequestTimeUpdate(), also reached through
+ * ForceUpdate(). The UI sets its pending flag AFTER ForceUpdate() returns,
+ * so listener callbacks must run later, outside the game's update stack.
+ * Use the game's own weak_ptr-aware dispatcher to retain listener lifetime
+ * management and the normal success triggers. All offsets below are for
+ * the signature-checked 1.104.1 ARM64 build. */
+typedef void (*time_service_notify_fn)(void *service, void *listeners,
+                                       uintptr_t method, ptrdiff_t adjustment);
+static time_service_notify_fn time_service_notify;
+static void *pending_time_service;
+
 static bool spoof_time_service_request_update(void *time_service) {
   uint8_t *ts = (uint8_t *)time_service;
+  if (pending_time_service || *(uint8_t *)(ts + 0xe8) ||
+      *(int32_t *)(ts + 0x104) > 0)
+    return false;
+
+  *(uint8_t *)(ts + 0xe8) = 1; /* request in flight */
+  *(int32_t *)(ts + 0x104) = *(int32_t *)(ts + 0xd0);
+  pending_time_service = time_service;
+  return true;
+}
+
+static void process_offline_time_sync(void) {
+  uint8_t *ts = (uint8_t *)pending_time_service;
+  if (!ts) return;
+  /* A listener may request another update; leave that for the next frame. */
+  pending_time_service = NULL;
   const int64_t now = (int64_t)time(NULL);
 
   *(uint8_t *)(ts + 0xe8) = 0;    /* no request in flight */
@@ -447,8 +467,9 @@ static bool spoof_time_service_request_update(void *time_service) {
   *(int64_t *)(ts + 0xf0) = now;  /* local clock at "request" */
   *(int64_t *)(ts + 0xf8) = now;  /* corrected server epoch */
   *(int32_t *)(ts + 0x100) = 0;   /* baseline offset (perfect sync) */
-  *(int32_t *)(ts + 0x104) = *(int32_t *)(ts + 0xd0); /* configured retry cadence */
-  return true;
+  /* ARM64 libc++ member pointer: virtual slot 0x10, adjustment 0 + virtual
+   * bit 1. This is the exact success dispatch used by OnDownloadResponse(). */
+  time_service_notify(ts, ts + 0x108, 0x10, 1);
 }
 
 typedef void *(*splash_game_get_fn)(void);
@@ -632,6 +653,28 @@ static void install_offline_service_patches(void) {
   if (!code || memcmp(code, expected_time_service_request_update,
                       sizeof expected_time_service_request_update) != 0)
     fatal_error("Unsupported TimeService code in libmortargame.so.");
+
+  static const char time_service_response[] =
+      "_ZN7Jetpack11TimeService18OnDownloadResponseEPN6Mortar11HttpRequestEPNS1_12HttpResponseE";
+  static const uint32_t expected_time_service_dispatch[] = {
+    UINT32_C(0xd10203ff), /* sub sp, sp, #0x80 */
+    UINT32_C(0xa9027bfd), /* stp x29, x30, [sp, #0x20] */
+    UINT32_C(0xf9001bfb), /* str x27, [sp, #0x30] */
+    UINT32_C(0xa90467fa), /* stp x26, x25, [sp, #0x40] */
+  };
+  const uint32_t *response = (const uint32_t *)so_find_addr(
+      &mortar_mod, time_service_response);
+  /* Verify both the success member pointer and its call to the internal
+   * dispatcher before reusing that helper at OnDownloadResponse + 0x290. */
+  if (!response || response[0xa8 / 4] != UINT32_C(0x52800023) ||
+      response[0xac / 4] != UINT32_C(0x52800202) ||
+      response[0x15c / 4] != UINT32_C(0x9400004d) ||
+      memcmp(response + 0x290 / 4, expected_time_service_dispatch,
+             sizeof expected_time_service_dispatch) != 0)
+    fatal_error("Unsupported TimeService listener code in libmortargame.so.");
+  time_service_notify = (time_service_notify_fn)(
+      so_find_addr_rx(&mortar_mod, time_service_response) + 0x290);
+
   hook_arm64((uintptr_t)code, (uintptr_t)spoof_time_service_request_update);
   armDCacheFlush(code, 4 * sizeof(*code));
 }
@@ -790,6 +833,10 @@ static int64_t event_time_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+typedef enum {
+  TOUCH_NONE, TOUCH_PHYSICAL, TOUCH_MINUS, TOUCH_CURSOR
+} TouchSource;
+
 typedef struct {
   PadState pad;
   HidTouchScreenState touch_state;
@@ -799,7 +846,8 @@ typedef struct {
   uint64_t previous_ns;
   int cursor_visible;
   int mouse_mode; /* 1 = on-screen cursor active, 0 = full controller passthrough */
-  int prev_hat; /* bitmask of virtual dpad state: bit0=up, bit1=down, bit2=left, bit3=right */
+  int prev_hat; /* combined physical/stick D-pad: up, down, left, right */
+  TouchSource touch_source;
 } InputState;
 
 typedef struct { uint64_t button; int android_key; } KeyBinding;
@@ -807,11 +855,9 @@ static const KeyBinding key_bindings[] = {
   { HidNpadButton_A,      96 }, { HidNpadButton_B,      97 },
   { HidNpadButton_X,      99 }, { HidNpadButton_Y,     100 },
   { HidNpadButton_L,     102 }, { HidNpadButton_R,     103 },
-  { HidNpadButton_ZL,    104 }, { HidNpadButton_ZR,    105 },
+  { HidNpadButton_ZR,    105 },
   { HidNpadButton_StickL,106 }, { HidNpadButton_StickR,107 },
-  { HidNpadButton_Plus,  108 }, { HidNpadButton_Minus, 109 },
-  { HidNpadButton_Up,     19 }, { HidNpadButton_Down,   20 },
-  { HidNpadButton_Left,   21 }, { HidNpadButton_Right,  22 },
+  { HidNpadButton_Plus,  108 },
 };
 
 static uint64_t monotonic_ns(void) {
@@ -828,10 +874,7 @@ static void input_init(InputState *input) {
   input->cursor_x = input->last_x = 0.5f;
   input->cursor_y = input->last_y = 0.5f;
   input->previous_ns = monotonic_ns();
-  input->cursor_visible =
-      appletGetOperationMode() == AppletOperationMode_Console;
-  input->mouse_mode = 0; /* default: controller passthrough off -> on-screen cursor disabled; press ZL to toggle */
-  input->prev_hat = 0;
+  /* Controller mode starts with the cursor hidden in handheld and docked. */
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
@@ -849,20 +892,14 @@ static void input_update(InputState *input, const MortarApi *api,
   const uint64_t up = padGetButtonsUp(&input->pad);
   const uint64_t held = padGetButtons(&input->pad);
 
-  /* ZL toggles on-screen mouse mode (edge-detect on press). Do not forward ZL as an android key. */
+  /* The common D-pad/touch paths below release state from the old mode. */
   if (down & HidNpadButton_ZL) {
     input->mouse_mode = !input->mouse_mode;
-    /* if disabling mouse mode, ensure any synthetic touch is released */
-    if (!input->mouse_mode && input->active_touch) {
-      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-      input->active_touch = 0;
-    }
-    if (!input->mouse_mode) input->cursor_visible = 0;
+    if (!input->mouse_mode)
+      api->motion(env, thiz, 0, 0, 0.0f, 0.0f);
   }
 
   for (size_t i = 0; i < sizeof key_bindings / sizeof key_bindings[0]; ++i) {
-    /* skip ZL since it's used for toggling mouse mode; skip Minus because it simulates a bottom-center touch */
-    if (key_bindings[i].button == HidNpadButton_ZL || key_bindings[i].button == HidNpadButton_Minus) continue;
     if (down & key_bindings[i].button)
       api->key(env, thiz, key_bindings[i].android_key, 1, 0, 0);
     if (up & key_bindings[i].button)
@@ -879,29 +916,21 @@ static void input_update(InputState *input, const MortarApi *api,
   if (sx > -0.14f && sx < 0.14f) sx = 0.0f;
   if (sy > -0.14f && sy < 0.14f) sy = 0.0f;
 
-  /* Minus / Select button: simulate touch at bottom-center regardless of mouse_mode. */
-  {
-    float minus_x = 0.5f;
-    float minus_y = (screen_height > 1) ? ((float)(screen_height - 1) / (float)screen_height) : 0.999f;
-    if (down & HidNpadButton_Minus) {
-      send_touch(api, env, thiz, 0, minus_x, minus_y);
-    }
-    if (up & HidNpadButton_Minus) {
-      send_touch(api, env, thiz, 1, minus_x, minus_y);
-    }
+  /* Emit transitions for the combined state, including in mouse mode, so
+   * leaving stick navigation releases it without cancelling a held D-pad. */
+  const int mask =
+      ((held & HidNpadButton_Up) || (!input->mouse_mode && sy > 0.5f) ? 1 : 0) |
+      ((held & HidNpadButton_Down) || (!input->mouse_mode && sy < -0.5f) ? 2 : 0) |
+      ((held & HidNpadButton_Left) || (!input->mouse_mode && sx < -0.5f) ? 4 : 0) |
+      ((held & HidNpadButton_Right) || (!input->mouse_mode && sx > 0.5f) ? 8 : 0);
+  const int changed = mask ^ input->prev_hat;
+  for (int i = 0; i < 4; ++i) {
+    if (changed & (1 << i))
+      api->key(env, thiz, 19 + i, (mask & (1 << i)) != 0, 0, 0);
   }
-
-  int physical = 0;
-  float x = input->cursor_x, y = input->cursor_y;
-  if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
-      input->touch_state.count > 0) {
-    physical = 1;
-    x = (float)input->touch_state.touches[0].x / (float)screen_width;
-    y = (float)input->touch_state.touches[0].y / (float)screen_height;
-  }
+  input->prev_hat = mask;
 
   if (input->mouse_mode) {
-    if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
     input->cursor_x += sx * dt * 0.75f;
     input->cursor_y -= sy * dt * 0.75f;
     if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
@@ -909,62 +938,39 @@ static void input_update(InputState *input, const MortarApi *api,
     if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
     if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
     api->motion(env, thiz, 0, 0, sx, -sy);
-
-    if (physical) {
-      input->cursor_visible = 0;
-      x = (float)input->touch_state.touches[0].x / (float)screen_width;
-      y = (float)input->touch_state.touches[0].y / (float)screen_height;
-    } else {
-      x = input->cursor_x;
-      y = input->cursor_y;
-    }
-    const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
-    if (button_touch && !physical) input->cursor_visible = 1;
-    const int wanted = physical || button_touch;
-    if (wanted && !input->active_touch)
-      send_touch(api, env, thiz, 0, x, y);
-    else if (wanted)
-      send_touch(api, env, thiz, 2, x, y);
-    else if (input->active_touch)
-      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-    input->active_touch = wanted;
-    if (wanted) {
-      input->last_x = x;
-      input->last_y = y;
-    }
-  } else {
-    /* controller passthrough mode: keep actual touchscreen input active while mapping left analog stick to D-Pad */
-    if (physical) {
-      if (!input->active_touch)
-        send_touch(api, env, thiz, 0, x, y);
-      else
-        send_touch(api, env, thiz, 2, x, y);
-      input->active_touch = 1;
-      input->last_x = x;
-      input->last_y = y;
-    } else if (input->active_touch) {
-      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-      input->active_touch = 0;
-    }
-
-    const float hat_thresh = 0.5f;
-    int hat_up = (sy > hat_thresh) ? 1 : 0;
-    int hat_down = (sy < -hat_thresh) ? 1 : 0;
-    int hat_left = (sx < -hat_thresh) ? 1 : 0;
-    int hat_right = (sx > hat_thresh) ? 1 : 0;
-    int mask = (hat_up ? 1 : 0) | (hat_down ? 2 : 0) | (hat_left ? 4 : 0) | (hat_right ? 8 : 0);
-    int prev = input->prev_hat;
-    /* Android key codes: Up=19, Down=20, Left=21, Right=22 */
-    if ((mask & 1) && !(prev & 1)) api->key(env, thiz, 19, 1, 0, 0);
-    if (!(mask & 1) && (prev & 1)) api->key(env, thiz, 19, 0, 0, 0);
-    if ((mask & 2) && !(prev & 2)) api->key(env, thiz, 20, 1, 0, 0);
-    if (!(mask & 2) && (prev & 2)) api->key(env, thiz, 20, 0, 0, 0);
-    if ((mask & 4) && !(prev & 4)) api->key(env, thiz, 21, 1, 0, 0);
-    if (!(mask & 4) && (prev & 4)) api->key(env, thiz, 21, 0, 0, 0);
-    if ((mask & 8) && !(prev & 8)) api->key(env, thiz, 22, 1, 0, 0);
-    if (!(mask & 8) && (prev & 8)) api->key(env, thiz, 22, 0, 0, 0);
-    input->prev_hat = mask;
   }
+
+  const int physical = hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
+                       input->touch_state.count > 0;
+  input->cursor_visible = input->mouse_mode && !physical;
+
+  /* One pointer, with explicit priority: real finger, Minus, cursor click.
+   * Releasing a lower-priority source must not release the current owner. */
+  TouchSource source = TOUCH_NONE;
+  float x = input->cursor_x, y = input->cursor_y;
+  if (physical) {
+    source = TOUCH_PHYSICAL;
+    /* HID coordinates describe the 1280x720 touch surface, not the render target. */
+    x = (float)input->touch_state.touches[0].x / 1280.0f;
+    y = (float)input->touch_state.touches[0].y / 720.0f;
+  } else if (held & HidNpadButton_Minus) {
+    source = TOUCH_MINUS;
+    x = 0.5f;
+    y = (float)(screen_height - 1) / (float)screen_height;
+  } else if (input->mouse_mode &&
+             (held & (HidNpadButton_A | HidNpadButton_ZR))) {
+    source = TOUCH_CURSOR;
+  }
+
+  if (input->active_touch && source != input->touch_source)
+    send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+  if (source) {
+    send_touch(api, env, thiz, source == input->touch_source ? 2 : 0, x, y);
+    input->last_x = x;
+    input->last_y = y;
+  }
+  input->active_touch = source != TOUCH_NONE;
+  input->touch_source = source;
 }
 
 typedef struct {
@@ -1016,7 +1022,7 @@ static void cursor_renderer_init(CursorRenderer *cursor) {
 
 static void cursor_renderer_draw(const CursorRenderer *cursor,
                                  const InputState *input) {
-  if (!cursor->ready || !input->cursor_visible) return;
+  if (!cursor->ready || !input->mouse_mode || !input->cursor_visible) return;
   GLint old_program = 0, old_buffer = 0, old_framebuffer = 0;
   GLint old_viewport[4] = {0};
   GLint attribute_enabled = 0;
@@ -1223,6 +1229,7 @@ int main(int argc, char **argv) {
     input_update(&input, &api, env, thiz);
     jni_process_soft_keyboard();
     jni_process_deferred_callbacks();
+    process_offline_time_sync();
     const jboolean keep_running = api.step(env, thiz);
     if (resuming) resuming = api.resume_step(env, thiz) != 0;
     cursor_renderer_draw(&cursor, &input);

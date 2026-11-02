@@ -18,3 +18,5 @@ assets.nxidx.tmp
 *.elf
 *.nacp
 *.nro
+/dist/
+/.build-release.log
