@@ -9,7 +9,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET    := jetpackjoyride_nx
 APP_TITLE := Jetpack Joyride
 APP_AUTHOR := naga
-APP_VERSION := 1.0.1
+APP_VERSION := 1.0.2
 APP_ICON  := $(TOPDIR)/icon.jpg
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 BUILD     := build
