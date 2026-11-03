@@ -29,6 +29,9 @@ LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,--gc-sections
 # Recent Mesa builds also require Vulkan, zstd and Expat; keep archive
 # dependencies in a group so their cross-references resolve correctly.
 PKG_CONFIG := aarch64-none-elf-pkg-config
+# Publish all EGL presentation paths, including guest import tables.
+LDFLAGS += -Wl,--wrap=eglSwapBuffers,--wrap=eglGetProcAddress,--wrap=__libnx_exit
+
 LIBS := -Wl,--start-group $(shell $(PKG_CONFIG) --libs sdl2 glesv2 egl) \
         -ldrm_nouveau -lz -lnx -lm -Wl,--end-group
 

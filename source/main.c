@@ -1,5 +1,6 @@
 /* Jetpack Joyride 1.104.1 / Halfbrick Mortar host for Nintendo Switch. */
 
+#include "saltynx.h"
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
@@ -1078,6 +1079,8 @@ static const char *game_language(void) {
 }
 
 int main(int argc, char **argv) {
+  saltynx_start();
+  atexit(saltynx_stop);
   (void)argc;
   (void)argv;
 

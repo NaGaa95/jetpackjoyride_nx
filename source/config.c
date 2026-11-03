@@ -29,8 +29,7 @@ int screen_height = 720;
 
 static inline void parse_var(const char *name, const char *value) {
   // retired options -> drop them and rewrite the file without them
-  if (!strcmp(name, "touchscreen") || !strcmp(name, "controller_cursor") ||
-      !strcmp(name, "show_fps") || !strcmp(name, "widescreen")) {
+  if (!strcmp(name, "touchscreen") || !strcmp(name, "controller_cursor") || !strcmp(name, "widescreen")) {
     config_needs_rewrite = 1;
     return;
   }
